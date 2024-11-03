@@ -1129,14 +1129,14 @@ class QSTOPTDecoder(OPTPreTrainedModel):
         # check if head_mask has a correct number of layers specified if desired
         for attn_mask, mask_name in zip([head_mask], ["head_mask"]):
             if attn_mask is not None:
-                if attn_mask.size()[0] != (len(self.blackbone)):
+                if attn_mask.size()[0] != (len(self.backbone)):
                     raise ValueError(
-                        f"The `{mask_name}` should be specified for {len(self.blackbone)} layers, but it is for"
+                        f"The `{mask_name}` should be specified for {len(self.backbone)} layers, but it is for"
                         f" {head_mask.size()[0]}."
                     )
 
         qst_hidden_states = self.downsample[0](hidden_states)
-        for idx, decoder_layer in enumerate(self.blackbone):
+        for idx, decoder_layer in enumerate(self.backbone):
 
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
