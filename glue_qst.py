@@ -109,7 +109,7 @@ def train(task, parameters, sub_sample_size=-1):
     print(f"Loading dataset for task: {actual_task}")
     dataset = load_dataset("glue", task)
     if sub_sample_size != -1:
-        dataset = dataset['train'].shuffle(seed=42).select(range(sub_sample_size)) 
+        dataset['train'] = dataset['train'].shuffle(seed=42).select(range(sub_sample_size)) 
     metric = load('glue', task)
 
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=True, max_length=max_len)
