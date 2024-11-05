@@ -94,7 +94,7 @@ GLUE_TASKS = ["mrpc", "rte"]
 DEFAULT_PAD_TOKEN = "[PAD]"
 
 
-def train(task, parameters):
+def train(task, parameters, sub_sample_size=-1):
     batch_size = parameters[task]["batch_size"]
     model_checkpoint = parameters["model_checkpoint"]
     epoch = parameters[task]["epoch"]
@@ -108,6 +108,8 @@ def train(task, parameters):
 
     print(f"Loading dataset for task: {actual_task}")
     dataset = load_dataset("glue", task)
+    if sub_sample_size != -1:
+        dataset = dataset['train'].shuffle(seed=42).select(range(sub_sample_size)) 
     metric = load('glue', task)
 
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=True, max_length=max_len)
@@ -252,6 +254,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, required=True, help="batch size")
     parser.add_argument("--model_checkpoint", type=str, required=True, help="model checkpoint")
     parser.add_argument("--qst_checkpoint", type=str, default=None, help="model checkpoint")
+    parser.add_argument("--subsample_size", type=int, default=-1, help="Subsample size")
 
     args = parser.parse_args()
     parameters = {
@@ -281,7 +284,7 @@ if __name__ == "__main__":
             continue
 
         result_dict[task] = {}
-        result, log, train_time = train(task, parameters)
+        result, log, train_time = train(task, parameters, args.subsample_size)
 
         values = []
         for elem in log:
