@@ -1,6 +1,5 @@
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]="2"
 import pickle
 import time
 
@@ -14,7 +13,7 @@ from transformers import AutoTokenizer, TrainingArguments, BitsAndBytesConfig, \
     Trainer, AutoConfig, DataCollatorWithPadding,AutoModelForSequenceClassification
 from QSTConfig import QSTConfig
 from typing import Dict
-from modeling_llama_qst import QSTLlamaForSequenceClassification, LlamaForSequenceClassification
+from modeling_opt_qst import QSTOPTForSequenceClassification
 
 import warnings
 
@@ -90,7 +89,8 @@ task_to_keys = {
     "stsb": ("sentence1", "sentence2"),
 }
 
-GLUE_TASKS = ["mrpc"]
+# GLUE_TASKS = ["cola", "mnli", "mrpc", "qnli", "qqp", "rte", "sst2", "stsb"]
+GLUE_TASKS = ["mrps", "rte"]
 DEFAULT_PAD_TOKEN = "[PAD]"
 
 
@@ -172,7 +172,7 @@ def train(task, parameters):
         peft_hidden_size=16  # here
     )
 
-    model = QSTLlamaForSequenceClassification(LLM, config, qst_config)
+    model = QSTOPTForSequenceClassification(LLM, config, qst_config)
     model.config.pad_token_id = tokenizer.pad_token_id
     # LLaMA tokenizer may not have correct special tokens set.
     # Check and add them if missing to prevent them from being parsed into different tokens.
