@@ -90,7 +90,7 @@ task_to_keys = {
 }
 
 # GLUE_TASKS = ["cola", "mnli", "mrpc", "qnli", "qqp", "rte", "sst2", "stsb"]
-GLUE_TASKS = ["mrps", "rte"]
+GLUE_TASKS = ["mrpc", "rte"]
 DEFAULT_PAD_TOKEN = "[PAD]"
 
 
