@@ -2,3 +2,5 @@ facebook/
 meta-llama/
 __pycache__/
 *.pkl
+*.pickle
+*.txt
