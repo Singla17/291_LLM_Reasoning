@@ -1,16 +1,17 @@
-import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"]="4"
+
 import pickle
 import time
 
-# import GPUtil
+# # import GPUtil
 from datasets import load_dataset
 from evaluate import load
 import numpy as np
 import torch
 import transformers
 from transformers import AutoTokenizer, TrainingArguments, BitsAndBytesConfig, \
-    Trainer, AutoConfig, DataCollatorWithPadding,AutoModelForSequenceClassification
+     Trainer, AutoConfig, DataCollatorWithPadding,AutoModelForSequenceClassification
 from QSTConfig import QSTConfig
 from typing import Dict
 from modeling_opt_qst import QSTOPTForSequenceClassification
@@ -23,15 +24,6 @@ warnings.filterwarnings("ignore",
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
-
-# class MemoryLoggingCallback(TrainerCallback):
-#     def __init__(self):
-#         super().__init__()
-#         self.memory_allocated = []
-#
-#     def on_step_end(self, args, state, control, **kwargs):
-#         initial_memory = GPUtil.getGPUs()[0].memoryUsed
-#         self.memory_allocated.append(initial_memory)
 
 def smart_tokenizer_and_embedding_resize(
         special_tokens_dict: Dict,
@@ -77,7 +69,6 @@ def print_trainable_parameters(args, model):
         f"trainable: {100 * trainable_params / all_param}"
     )
 
-
 task_to_keys = {
     "cola": ("sentence", None),
     "mnli": ("premise", "hypothesis"),
@@ -89,12 +80,11 @@ task_to_keys = {
     "stsb": ("sentence1", "sentence2"),
 }
 
-# GLUE_TASKS = ["cola", "mnli", "mrpc", "qnli", "qqp", "rte", "sst2", "stsb"]
 GLUE_TASKS = ["mrpc", "rte"]
 DEFAULT_PAD_TOKEN = "[PAD]"
 
 
-def train(task, parameters, sub_sample_size=-1):
+def train(task, parameters):
     batch_size = parameters[task]["batch_size"]
     model_checkpoint = parameters["model_checkpoint"]
     epoch = parameters[task]["epoch"]
@@ -108,8 +98,6 @@ def train(task, parameters, sub_sample_size=-1):
 
     print(f"Loading dataset for task: {actual_task}")
     dataset = load_dataset("glue", task)
-    if sub_sample_size != -1:
-        dataset['train'] = dataset['train'].shuffle(seed=42).select(range(sub_sample_size)) 
     metric = load('glue', task)
 
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=True, max_length=max_len)
@@ -123,7 +111,7 @@ def train(task, parameters, sub_sample_size=-1):
         bnb_4bit_compute_dtype=torch.bfloat16
     )
 
-    LLM = AutoModelForSequenceClassification.from_pretrained(model_checkpoint,
+    LLM = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, 
                                                          quantization_config=quant_config, torch_dtype=torch.bfloat16,
                                                          num_labels=num_labels,device_map="auto")
 
@@ -248,63 +236,53 @@ def train(task, parameters, sub_sample_size=-1):
 
     return results, trainer.state.log_history, (end_time - start_time)
 
-
-if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"]="5"
-    parser = argparse.ArgumentParser(description="Paramters of QST.")
-    parser.add_argument("--batch_size", type=int, required=True, help="batch size")
-    parser.add_argument("--model_checkpoint", type=str, required=True, help="model checkpoint")
-    parser.add_argument("--qst_checkpoint", type=str, default=None, help="model checkpoint")
-    parser.add_argument("--subsample_size", type=int, default=-1, help="Subsample size")
-
-    args = parser.parse_args()
-    parameters = {
-        "model_checkpoint": args.model_checkpoint,
-        "qst_checkpoint": args.qst_checkpoint,
-        "mnli": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 5E-04},
-        "sst2": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 5E-04},
-        "mrpc": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 4E-04},
-        "cola": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 5E-04},
-        "qnli": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 4E-04},
-        "qqp": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+parameters = {
+    "model_checkpoint": 'facebook/opt-1.3b',
+    "qst_checkpoint": None,
+    "mnli": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
                 "learning_rate": 5E-04},
-        "rte": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+    "sst2": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
                 "learning_rate": 5E-04},
-        "stsb": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 4E-04},
-    }
+    "mrpc": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+                "learning_rate": 4E-04},
+    "cola": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+                "learning_rate": 5E-04},
+    "qnli": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+                "learning_rate": 4E-04},
+    "qqp": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+            "learning_rate": 5E-04},
+    "rte": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+            "learning_rate": 5E-04},
+    "stsb": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+                "learning_rate": 4E-04},
+}
 
-    result_dict = {}
-    for task in GLUE_TASKS:
-        if task == "qnli":
+result_dict = {}
+for task in GLUE_TASKS:
+    if task == "qnli":
+        continue
+
+    result_dict[task] = {}
+    result, log, train_time = train(task, parameters)
+
+    values = []
+    for elem in log:
+        if "eval_loss" not in elem.keys():
             continue
+        if task == "cola":
+            values.append(elem['eval_matthews_correlation'])
+        elif task == "stsb":
+            values.append(elem['eval_pearson'])
+        else:
+            values.append(elem['eval_accuracy'])
 
-        result_dict[task] = {}
-        result, log, train_time = train(task, parameters, args.subsample_size)
+    best_acc = max(values)
+    result_dict[task]["acc"] = best_acc
+    result_dict[task]["time"] = train_time
+    # result_dict[task]["memory_usage"] = memory_usage
 
-        values = []
-        for elem in log:
-            if "eval_loss" not in elem.keys():
-                continue
-            if task == "cola":
-                values.append(elem['eval_matthews_correlation'])
-            elif task == "stsb":
-                values.append(elem['eval_pearson'])
-            else:
-                values.append(elem['eval_accuracy'])
+    print(f"Task:{task}: Best acc {best_acc}, Total training time {train_time}")
 
-        best_acc = max(values)
-        result_dict[task]["acc"] = best_acc
-        result_dict[task]["time"] = train_time
-        #result_dict[task]["memory_usage"] = memory_usage
-
-        print(f"Task:{task}: Best acc {best_acc}, Total training time {train_time}")
-
-    model_name = os.path.basename(parameters["model_checkpoint"])
-    with open(f"glue_qst_{task}_{model_name}_{args.batch_size}.pickle", 'wb') as f:
-        pickle.dump(result_dict, f)
+model_name = os.path.basename(parameters["model_checkpoint"])
+with open(f"glue_qst_{task}_{model_name}_{4}.pickle", 'wb') as f:
+    pickle.dump(result_dict, f)

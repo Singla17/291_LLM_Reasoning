@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]="7"
+os.environ["CUDA_VISIBLE_DEVICES"]="2"
 
 import pickle
 import time
@@ -239,21 +239,21 @@ def train(task, parameters):
 parameters = {
     "model_checkpoint": 'meta-llama/Llama-2-7b-hf',
     "qst_checkpoint": None,
-    "mnli": {"batch_size": 4, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+    "mnli": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
                 "learning_rate": 5E-04},
-    "sst2": {"batch_size": 4, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+    "sst2": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
                 "learning_rate": 5E-04},
-    "mrpc": {"batch_size": 4, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+    "mrpc": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
                 "learning_rate": 4E-04},
-    "cola": {"batch_size": 4, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+    "cola": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
                 "learning_rate": 5E-04},
-    "qnli": {"batch_size": 4, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+    "qnli": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
                 "learning_rate": 4E-04},
-    "qqp": {"batch_size": 4, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+    "qqp": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
             "learning_rate": 5E-04},
-    "rte": {"batch_size": 4, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+    "rte": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
             "learning_rate": 5E-04},
-    "stsb": {"batch_size": 4, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
+    "stsb": {"batch_size": 16, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
                 "learning_rate": 4E-04},
 }
 
