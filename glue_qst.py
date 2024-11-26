@@ -1,6 +1,5 @@
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]="2"
 import pickle
 import time
 
@@ -10,19 +9,92 @@ from evaluate import load
 import numpy as np
 import torch
 import transformers
-from transformers import AutoTokenizer, TrainingArguments, BitsAndBytesConfig, \
-    Trainer, AutoConfig, DataCollatorWithPadding,AutoModelForSequenceClassification
+from transformers import (
+    AutoTokenizer,
+    TrainingArguments,
+    BitsAndBytesConfig,
+    Trainer,
+    AutoConfig,
+    DataCollatorWithPadding,
+    AutoModelForSequenceClassification,
+)
 from QSTConfig import QSTConfig
 from typing import Dict
-from modeling_llama_qst import QSTLlamaForSequenceClassification, LlamaForSequenceClassification
+from modeling_opt_qst import (
+    QSTOPTForSequenceClassification,
+    set_adapter,
+)
+
 
 import warnings
 
 # Filter out the specific warning
-warnings.filterwarnings("ignore",
-                        message="Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.")
+warnings.filterwarnings(
+    "ignore",
+    message="Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.",
+)
 
 torch.backends.cuda.matmul.allow_tf32 = True
+
+
+def get_layer_wise_learning_rates(model, learning_rate, decay_factor=0.95):
+    """
+    Implements Layer-wise Learning Rate Decay (LLRD)
+    - Top layers: Higher learning rates
+    - Bottom layers: Lower learning rates
+    - Exponential decay between layers
+    """
+    parameter_groups = []
+    layer_names = set()
+
+    # More robust layer ID extraction
+    for name, param in model.named_parameters():
+        if "qst_layers" in name:
+            # Parse layer ID more carefully
+            try:
+                # Look for numbers after "qst_layers."
+                parts = name.split(".")
+                for i, part in enumerate(parts):
+                    if part == "qst_layers" and i + 1 < len(parts):
+                        if parts[i + 1].isdigit():
+                            layer_id = int(parts[i + 1])
+                            layer_names.add(layer_id)
+                            break
+            except (IndexError, ValueError):
+                continue
+
+    if not layer_names:
+        # Fallback if no layers found
+        return [{"params": model.parameters(), "lr": learning_rate}]
+
+    sorted_layers = sorted(list(layer_names), reverse=True)
+
+    # Assign learning rates with exponential decay
+    for layer_id in sorted_layers:
+        layer_lr = learning_rate * (decay_factor ** (len(sorted_layers) - 1 - layer_id))
+
+        # Group parameters with same layer id
+        params = []
+        for name, param in model.named_parameters():
+            try:
+                if f"qst_layers.{layer_id}." in name:
+                    params.append(param)
+            except ValueError:
+                continue
+
+        if params:
+            parameter_groups.append({"params": params, "lr": layer_lr})
+
+    # Add remaining parameters with base learning rate
+    other_params = []
+    for name, param in model.named_parameters():
+        if not any(f"qst_layers.{l}." in name for l in sorted_layers):
+            other_params.append(param)
+
+    if other_params:
+        parameter_groups.append({"params": other_params, "lr": learning_rate})
+
+    return parameter_groups
 
 
 # class MemoryLoggingCallback(TrainerCallback):
@@ -34,10 +106,11 @@ torch.backends.cuda.matmul.allow_tf32 = True
 #         initial_memory = GPUtil.getGPUs()[0].memoryUsed
 #         self.memory_allocated.append(initial_memory)
 
+
 def smart_tokenizer_and_embedding_resize(
-        special_tokens_dict: Dict,
-        tokenizer: transformers.PreTrainedTokenizer,
-        model: transformers.PreTrainedModel,
+    special_tokens_dict: Dict,
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: transformers.PreTrainedModel,
 ):
     """Resize tokenizer and embedding.
 
@@ -50,7 +123,9 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings_data = model.get_input_embeddings().weight.data
         # output_embeddings_data = model.get_output_embeddings().weight.data
 
-        input_embeddings_avg = input_embeddings_data[:-num_new_tokens].mean(dim=0, keepdim=True)
+        input_embeddings_avg = input_embeddings_data[:-num_new_tokens].mean(
+            dim=0, keepdim=True
+        )
         # output_embeddings_avg = output_embeddings_data[:-num_new_tokens].mean(dim=0, keepdim=True)
 
         input_embeddings_data[-num_new_tokens:] = input_embeddings_avg
@@ -71,7 +146,8 @@ def print_trainable_parameters(args, model):
         all_param += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
-    if args.bits == 4: trainable_params /= 2
+    if args.bits == 4:
+        trainable_params /= 2
     print(
         f"trainable params: {trainable_params} || "
         f"all params: {all_param} || "
@@ -90,11 +166,12 @@ task_to_keys = {
     "stsb": ("sentence1", "sentence2"),
 }
 
-GLUE_TASKS = ["mrpc"]
+# GLUE_TASKS = ["cola", "mnli", "mrpc", "qnli", "qqp", "rte", "sst2", "stsb"]
+GLUE_TASKS = ["mrpc", "rte"]
 DEFAULT_PAD_TOKEN = "[PAD]"
 
 
-def train(task, parameters):
+def train(task, parameters, sub_sample_size=-1):
     batch_size = parameters[task]["batch_size"]
     model_checkpoint = parameters["model_checkpoint"]
     epoch = parameters[task]["epoch"]
@@ -102,15 +179,22 @@ def train(task, parameters):
     alpha_r = parameters[task]["alpha_r"]
     learning_rate = parameters[task]["learning_rate"]
     max_len = parameters[task]["max_seqlen"]
-    qst_checkpoint = parameters['qst_checkpoint']
+    qst_checkpoint = parameters["qst_checkpoint"]
+    llrd = parameters["llrd"]
 
     actual_task = "mnli" if task == "mnli-mm" else task
 
     print(f"Loading dataset for task: {actual_task}")
     dataset = load_dataset("glue", task)
-    metric = load('glue', task)
+    if sub_sample_size != -1:
+        dataset["train"] = (
+            dataset["train"].shuffle(seed=42).select(range(sub_sample_size))
+        )
+    metric = load("glue", task)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=True, max_length=max_len)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_checkpoint, use_fast=True, max_length=max_len
+    )
 
     num_labels = 3 if task.startswith("mnli") else 1 if task == "stsb" else 2
 
@@ -118,12 +202,16 @@ def train(task, parameters):
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16
+        bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    LLM = AutoModelForSequenceClassification.from_pretrained(model_checkpoint,
-                                                         quantization_config=quant_config, torch_dtype=torch.bfloat16,
-                                                         num_labels=num_labels,device_map="auto")
+    LLM = AutoModelForSequenceClassification.from_pretrained(
+        model_checkpoint,
+        quantization_config=quant_config,
+        torch_dtype=torch.bfloat16,
+        num_labels=num_labels,
+        device_map="auto",
+    )
 
     if tokenizer._pad_token is None:
         # smart_tokenizer_and_embedding_resize(
@@ -137,24 +225,35 @@ def train(task, parameters):
 
     def preprocess_function(examples):
         if sentence2_key is None:
-            return tokenizer(examples[sentence1_key], truncation=True, padding=True, )
-        return tokenizer(examples[sentence1_key], examples[sentence2_key], truncation=True, padding=True, )
+            return tokenizer(
+                examples[sentence1_key],
+                truncation=True,
+                padding=True,
+            )
+        return tokenizer(
+            examples[sentence1_key],
+            examples[sentence2_key],
+            truncation=True,
+            padding=True,
+        )
 
     encoded_dataset = dataset.map(preprocess_function, batched=True)
-
-
 
     # config = AutoConfig.from_pretrained(model_checkpoint)
     # config.hidden_size = 64
 
-
-
-    validation_key = "validation_mismatched" if task == "mnli-mm" else "validation_matched" if task == "mnli" else "validation"
+    validation_key = (
+        "validation_mismatched"
+        if task == "mnli-mm"
+        else "validation_matched" if task == "mnli" else "validation"
+    )
     num_samples = len(encoded_dataset[validation_key])
     num_batches = num_samples // batch_size
     valid_samples = num_batches * batch_size
 
-    encoded_dataset[validation_key] = encoded_dataset[validation_key].select(range(valid_samples))
+    encoded_dataset[validation_key] = encoded_dataset[validation_key].select(
+        range(valid_samples)
+    )
 
     config = AutoConfig.from_pretrained(model_checkpoint)
     config.pad_token_id = config.eos_token_id
@@ -169,10 +268,10 @@ def train(task, parameters):
         dropout=0.1,
         activation="swish",
         fan_in_fan_out=False,
-        peft_hidden_size=16  # here
+        peft_hidden_size=16,  # here
     )
 
-    model = QSTLlamaForSequenceClassification(LLM, config, qst_config)
+    model = QSTOPTForSequenceClassification(LLM, config, qst_config)
     model.config.pad_token_id = tokenizer.pad_token_id
     # LLaMA tokenizer may not have correct special tokens set.
     # Check and add them if missing to prevent them from being parsed into different tokens.
@@ -183,20 +282,24 @@ def train(task, parameters):
         print("Loading QST from checkpoint.")
         model.load_qst_state(qst_checkpoint)
     else:
-        print(f'initing QST modules...')
+        print(f"initing QST modules...")
 
     # use 16bit as the compute data type, comment it if you want to use 32bit
     for name, module in model.named_modules():
-        if 'qst' or 'z' or 'downsample' or 'upsample' in name:
+        if "qst" or "z" or "downsample" or "upsample" in name:
             module = module.to(torch.bfloat16)
-        if 'norm' in name:
+        if "norm" in name:
             module = module.to(torch.float32)
-        if 'lm_head' in name or 'embed_tokens' in name:
-            if hasattr(module, 'weight'):
+        if "lm_head" in name or "embed_tokens" in name:
+            if hasattr(module, "weight"):
                 if module.weight.dtype == torch.float32:
                     module = module.to(torch.bfloat16)
 
-    metric_name = "pearson" if task == "stsb" else "matthews_correlation" if task == "cola" else "accuracy"
+    metric_name = (
+        "pearson"
+        if task == "stsb"
+        else "matthews_correlation" if task == "cola" else "accuracy"
+    )
 
     def compute_metrics(eval_pred):
         predictions, labels = eval_pred
@@ -206,22 +309,33 @@ def train(task, parameters):
             predictions = predictions[:, 0]
         return metric.compute(predictions=predictions, references=labels)
 
+    # Initialize optimizer with layer-wise learning rates
+    if llrd:
+        optimizer_grouped_parameters = get_layer_wise_learning_rates(
+            model, learning_rate=learning_rate, decay_factor=0.95
+        )
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
+        lr_scheduler_type = "cosine_with_restarts"
+
+    else:
+        optimizer = None
+        lr_scheduler_type = "linear"
+
     train_args = TrainingArguments(
         f"{model_checkpoint}-QST-{task}",
         evaluation_strategy="epoch",
         save_strategy="epoch",
-        learning_rate=learning_rate,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         num_train_epochs=epoch,
         weight_decay=0.01,
         warmup_ratio=0.06,
-        lr_scheduler_type="linear",
+        lr_scheduler_type=lr_scheduler_type,
         load_best_model_at_end=True,
         metric_for_best_model=metric_name,
         logging_dir=f"{model_checkpoint}-QST-{task}-log",
         logging_strategy="epoch",
-        bf16=True
+        bf16=True,
     )
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
@@ -237,7 +351,7 @@ def train(task, parameters):
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
         data_collator=data_collator,
-        # callbacks=[memory_callback]
+        optimizers=(optimizer, None),  # Pass the custom optimizer
     )
 
     trainer.train()
@@ -250,30 +364,96 @@ def train(task, parameters):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Paramters of QST.")
     parser.add_argument("--batch_size", type=int, required=True, help="batch size")
-    parser.add_argument("--model_checkpoint", type=str, required=True, help="model checkpoint")
-    parser.add_argument("--qst_checkpoint", type=str, default=None, help="model checkpoint")
+    parser.add_argument(
+        "--model_checkpoint", type=str, required=True, help="model checkpoint"
+    )
+    parser.add_argument(
+        "--qst_checkpoint", type=str, default=None, help="model checkpoint"
+    )
+    parser.add_argument(
+        "--adapter_type",
+        required=False,
+        type=str,
+        default="regular",
+        choices=["regular", "balanced", "higher"],
+        help="balanced adapters",
+    )
+    parser.add_argument(
+        "--llrd", type=bool, default=False, help="layer-wise learning rate decay"
+    )
 
     args = parser.parse_args()
     parameters = {
         "model_checkpoint": args.model_checkpoint,
         "qst_checkpoint": args.qst_checkpoint,
-        "mnli": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 5E-04},
-        "sst2": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 5E-04},
-        "mrpc": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 4E-04},
-        "cola": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 5E-04},
-        "qnli": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 4E-04},
-        "qqp": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                "learning_rate": 5E-04},
-        "rte": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                "learning_rate": 5E-04},
-        "stsb": {"batch_size": args.batch_size, "epoch": 7, "r": 16, "alpha_r": 16, "max_seqlen": 512,
-                 "learning_rate": 4E-04},
+        "llrd": args.llrd,
+        "mnli": {
+            "batch_size": args.batch_size,
+            "epoch": 7,
+            "r": 16,
+            "alpha_r": 16,
+            "max_seqlen": 512,
+            "learning_rate": 5e-04,
+        },
+        "sst2": {
+            "batch_size": args.batch_size,
+            "epoch": 7,
+            "r": 16,
+            "alpha_r": 16,
+            "max_seqlen": 512,
+            "learning_rate": 5e-04,
+        },
+        "mrpc": {
+            "batch_size": args.batch_size,
+            "epoch": 7,
+            "r": 16,
+            "alpha_r": 16,
+            "max_seqlen": 512,
+            "learning_rate": 4e-04,
+        },
+        "cola": {
+            "batch_size": args.batch_size,
+            "epoch": 7,
+            "r": 16,
+            "alpha_r": 16,
+            "max_seqlen": 512,
+            "learning_rate": 5e-04,
+        },
+        "qnli": {
+            "batch_size": args.batch_size,
+            "epoch": 7,
+            "r": 16,
+            "alpha_r": 16,
+            "max_seqlen": 512,
+            "learning_rate": 4e-04,
+        },
+        "qqp": {
+            "batch_size": args.batch_size,
+            "epoch": 7,
+            "r": 16,
+            "alpha_r": 16,
+            "max_seqlen": 512,
+            "learning_rate": 5e-04,
+        },
+        "rte": {
+            "batch_size": args.batch_size,
+            "epoch": 7,
+            "r": 16,
+            "alpha_r": 16,
+            "max_seqlen": 512,
+            "learning_rate": 5e-04,
+        },
+        "stsb": {
+            "batch_size": args.batch_size,
+            "epoch": 7,
+            "r": 16,
+            "alpha_r": 16,
+            "max_seqlen": 512,
+            "learning_rate": 4e-04,
+        },
     }
+
+    set_adapter(args.adapter_type)
 
     result_dict = {}
     for task in GLUE_TASKS:
@@ -288,11 +468,11 @@ if __name__ == "__main__":
             if "eval_loss" not in elem.keys():
                 continue
             if task == "cola":
-                values.append(elem['eval_matthews_correlation'])
+                values.append(elem["eval_matthews_correlation"])
             elif task == "stsb":
-                values.append(elem['eval_pearson'])
+                values.append(elem["eval_pearson"])
             else:
-                values.append(elem['eval_accuracy'])
+                values.append(elem["eval_accuracy"])
 
         best_acc = max(values)
         result_dict[task]["acc"] = best_acc
@@ -302,5 +482,5 @@ if __name__ == "__main__":
         print(f"Task:{task}: Best acc {best_acc}, Total training time {train_time}")
 
     model_name = os.path.basename(parameters["model_checkpoint"])
-    with open(f"glue_qst_{task}_{model_name}_{args.batch_size}.pickle", 'wb') as f:
+    with open(f"glue_qst_{task}_{model_name}_{args.batch_size}.pickle", "wb") as f:
         pickle.dump(result_dict, f)

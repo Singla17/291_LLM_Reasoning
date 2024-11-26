@@ -19,13 +19,14 @@ from copy import deepcopy
 from typing import List, Optional, Tuple, Union
 
 from QSTGenerationMixin import QSTGenerationMixin
-from QSTConfig import AdapterLinear
+from QSTConfig import AdapterLinear, BalancedRankAdapterLinear, HigherRankAdapterLinear
 import bitsandbytes as bnb
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
@@ -43,8 +44,11 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.models.opt.configuration_opt import OPTConfig
-from modeling_qst_output import QSTBaseModelOutputWithPast, QSTCausalLMOutputWithPast, \
-    QSTSequenceClassifierOutputWithPast
+from modeling_qst_output import (
+    QSTBaseModelOutputWithPast,
+    QSTCausalLMOutputWithPast,
+    QSTSequenceClassifierOutputWithPast,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -70,10 +74,23 @@ OPT_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all OPT models at https://huggingface.co/models?filter=opt
 ]
 
+AdapterModule = AdapterLinear
+
+
+def set_adapter(adapter_type: str):
+    global AdapterModule
+    if adapter_type == "balanced_rank":
+        AdapterModule = BalancedRankAdapterLinear
+    elif adapter_type == "higher_rank":
+        AdapterModule = HigherRankAdapterLinear
+
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
-        input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
+    input_ids_shape: torch.Size,
+    dtype: torch.dtype,
+    device: torch.device,
+    past_key_values_length: int = 0,
 ):
     """
     Make causal mask used for bi-directional self-attention.
@@ -85,8 +102,18 @@ def _make_causal_mask(
     mask = mask.to(dtype)
 
     if past_key_values_length > 0:
-        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
-    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+        mask = torch.cat(
+            [
+                torch.zeros(
+                    tgt_len, past_key_values_length, dtype=dtype, device=device
+                ),
+                mask,
+            ],
+            dim=-1,
+        )
+    return mask[None, None, :, :].expand(
+        bsz, 1, tgt_len, tgt_len + past_key_values_length
+    )
 
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
@@ -100,7 +127,9 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
     inverted_mask = 1.0 - expanded_mask
 
-    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+    return inverted_mask.masked_fill(
+        inverted_mask.to(torch.bool), torch.finfo(dtype).min
+    )
 
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
@@ -114,12 +143,16 @@ class OPTLearnedPositionalEmbedding(nn.Embedding):
         self.offset = 2
         super().__init__(num_embeddings + self.offset, embedding_dim)
 
-    def forward(self, attention_mask: torch.LongTensor, past_key_values_length: int = 0):
+    def forward(
+        self, attention_mask: torch.LongTensor, past_key_values_length: int = 0
+    ):
         """`input_ids_shape` is expected to be [bsz x seqlen]."""
         attention_mask = attention_mask.long()
 
         # create positions depending on attention_mask
-        positions = (torch.cumsum(attention_mask, dim=1).type_as(attention_mask) * attention_mask).long() - 1
+        positions = (
+            torch.cumsum(attention_mask, dim=1).type_as(attention_mask) * attention_mask
+        ).long() - 1
 
         # cut positions if `past_key_values_length` is > 0
         positions = positions[:, past_key_values_length:]
@@ -131,12 +164,12 @@ class OPTAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
-            self,
-            embed_dim: int,
-            num_heads: int,
-            dropout: float = 0.0,
-            is_decoder: bool = False,
-            bias: bool = True,
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        is_decoder: bool = False,
+        bias: bool = True,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -149,7 +182,7 @@ class OPTAttention(nn.Module):
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
                 f" and `num_heads`: {num_heads})."
             )
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.is_decoder = is_decoder
 
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -158,16 +191,20 @@ class OPTAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        return (
+            tensor.view(bsz, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            key_value_states: Optional[torch.Tensor] = None,
-            past_key_value: Optional[Tuple[torch.Tensor]] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            layer_head_mask: Optional[torch.Tensor] = None,
-            output_attentions: bool = False,
+        self,
+        hidden_states: torch.Tensor,
+        key_value_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -228,15 +265,23 @@ class OPTAttention(nn.Module):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
                 )
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
+            attn_weights = (
+                attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                + attention_mask
+            )
             attn_weights = torch.max(
-                attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+                attn_weights,
+                torch.tensor(
+                    torch.finfo(attn_weights.dtype).min, device=attn_weights.device
+                ),
             )
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
         if attn_weights.dtype == torch.float16:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
+            attn_weights = nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(torch.float16)
         else:
             attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
@@ -246,7 +291,9 @@ class OPTAttention(nn.Module):
                     f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
                     f" {layer_head_mask.size()}"
                 )
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            )
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         if output_attentions:
@@ -254,12 +301,18 @@ class OPTAttention(nn.Module):
             # make sure that attn_weights keeps its gradient.
             # In order to do so, attn_weights have to be reshaped
             # twice and have to be reused in the following
-            attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
+            attn_weights_reshaped = attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            )
+            attn_weights = attn_weights_reshaped.view(
+                bsz * self.num_heads, tgt_len, src_len
+            )
         else:
             attn_weights_reshaped = None
 
-        attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+        attn_probs = nn.functional.dropout(
+            attn_weights, p=self.dropout, training=self.training
+        )
 
         attn_output = torch.bmm(attn_probs, value_states)
 
@@ -301,20 +354,24 @@ class OPTDecoderLayer(nn.Module):
         )
         self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
         self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
-        self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
+        self.final_layer_norm = nn.LayerNorm(
+            self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine
+        )
 
         self.final_layer_norm.weight.requires_grad = False
         self.final_layer_norm.bias.requires_grad = False
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            layer_head_mask: Optional[torch.Tensor] = None,
-            past_key_value: Optional[Tuple[torch.Tensor]] = None,
-            output_attentions: Optional[bool] = False,
-            use_cache: Optional[bool] = False,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+    ) -> Tuple[
+        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
+    ]:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -344,7 +401,9 @@ class OPTDecoderLayer(nn.Module):
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
         )
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = nn.functional.dropout(
+            hidden_states, p=self.dropout, training=self.training
+        )
         hidden_states = residual + hidden_states
 
         # 350m applies layer norm AFTER attention
@@ -364,7 +423,9 @@ class OPTDecoderLayer(nn.Module):
         hidden_states = self.activation_fn(hidden_states)
 
         hidden_states = self.fc2(hidden_states)
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = nn.functional.dropout(
+            hidden_states, p=self.dropout, training=self.training
+        )
 
         hidden_states = (residual + hidden_states).view(hidden_states_shape)
 
@@ -504,16 +565,24 @@ class OPTDecoder(OPTPreTrainedModel):
         self.max_target_positions = config.max_position_embeddings
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.word_embed_proj_dim, self.padding_idx)
-        self.embed_positions = OPTLearnedPositionalEmbedding(config.max_position_embeddings, config.hidden_size)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.word_embed_proj_dim, self.padding_idx
+        )
+        self.embed_positions = OPTLearnedPositionalEmbedding(
+            config.max_position_embeddings, config.hidden_size
+        )
 
         if config.word_embed_proj_dim != config.hidden_size:
-            self.project_out = nn.Linear(config.hidden_size, config.word_embed_proj_dim, bias=False)
+            self.project_out = nn.Linear(
+                config.hidden_size, config.word_embed_proj_dim, bias=False
+            )
         else:
             self.project_out = None
 
         if config.word_embed_proj_dim != config.hidden_size:
-            self.project_in = nn.Linear(config.word_embed_proj_dim, config.hidden_size, bias=False)
+            self.project_in = nn.Linear(
+                config.word_embed_proj_dim, config.hidden_size, bias=False
+            )
         else:
             self.project_in = None
 
@@ -522,12 +591,15 @@ class OPTDecoder(OPTPreTrainedModel):
         # see https://github.com/facebookresearch/metaseq/pull/164
         if config.do_layer_norm_before and not config._remove_final_layer_norm:
             self.final_layer_norm = nn.LayerNorm(
-                config.hidden_size, elementwise_affine=config.layer_norm_elementwise_affine
+                config.hidden_size,
+                elementwise_affine=config.layer_norm_elementwise_affine,
             )
         else:
             self.final_layer_norm = None
 
-        self.layers = nn.ModuleList([OPTDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [OPTDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -540,7 +612,9 @@ class OPTDecoder(OPTPreTrainedModel):
         self.embed_tokens = value
 
     # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
-    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+    def _prepare_decoder_attention_mask(
+        self, attention_mask, input_shape, inputs_embeds, past_key_values_length
+    ):
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         combined_attention_mask = None
@@ -554,26 +628,28 @@ class OPTDecoder(OPTPreTrainedModel):
 
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
-                inputs_embeds.device
-            )
+            expanded_attn_mask = _expand_mask(
+                attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
+            ).to(inputs_embeds.device)
             combined_attention_mask = (
-                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+                expanded_attn_mask
+                if combined_attention_mask is None
+                else expanded_attn_mask + combined_attention_mask
             )
 
         return combined_attention_mask
 
     def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            head_mask: Optional[torch.Tensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         r"""
         Args:
@@ -622,36 +698,52 @@ class OPTDecoder(OPTPreTrainedModel):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+            )
         elif input_ids is not None:
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
         else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+            raise ValueError(
+                "You have to specify either decoder_input_ids or decoder_inputs_embeds"
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         batch_size, seq_length = input_shape
-        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        past_key_values_length = (
+            past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        )
         # required mask seq length can be calculated via length of past
         mask_seq_length = past_key_values_length + seq_length
 
         # embed positions
         if attention_mask is None:
-            attention_mask = torch.ones(batch_size, mask_seq_length, device=inputs_embeds.device)
+            attention_mask = torch.ones(
+                batch_size, mask_seq_length, device=inputs_embeds.device
+            )
         elif attention_mask.shape[1] != mask_seq_length:
             raise ValueError(
                 f"The provided attention mask has length {attention_mask.shape[1]}, but its length should be "
@@ -698,7 +790,9 @@ class OPTDecoder(OPTPreTrainedModel):
                 if dropout_probability < self.layerdrop:
                     continue
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            past_key_value = (
+                past_key_values[idx] if past_key_values is not None else None
+            )
 
             if self.gradient_checkpointing and self.training:
 
@@ -746,7 +840,11 @@ class OPTDecoder(OPTPreTrainedModel):
 
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(
+                v
+                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
+                if v is not None
+            )
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -786,20 +884,22 @@ class QSTOPTDecoder(OPTPreTrainedModel):
             """
             if key in hf_device_map:
                 device_index = hf_device_map[key]
-            elif '' in hf_device_map:
-                device_index = hf_device_map['']
+            elif "" in hf_device_map:
+                device_index = hf_device_map[""]
             else:
                 # If neither key nor default key is in hf_device_map, return default_device
                 return default_device
 
             # Handle different types of device specifications
-            if isinstance(device_index, int) or (isinstance(device_index, str) and device_index.isdigit()):
+            if isinstance(device_index, int) or (
+                isinstance(device_index, str) and device_index.isdigit()
+            ):
                 # Device index is an integer or string digit (e.g., '0')
                 device = torch.device(f"cuda:{device_index}")
-            elif isinstance(device_index, str) and device_index.lower() == 'cpu':
+            elif isinstance(device_index, str) and device_index.lower() == "cpu":
                 # Device is specified as 'cpu'
-                device = torch.device('cpu')
-            elif isinstance(device_index, str) and device_index.startswith('cuda'):
+                device = torch.device("cpu")
+            elif isinstance(device_index, str) and device_index.startswith("cuda"):
                 # Device is specified as 'cuda:x'
                 device = torch.device(device_index)
             else:
@@ -814,11 +914,11 @@ class QSTOPTDecoder(OPTPreTrainedModel):
             """
             if key in hf_device_map:
                 device_index = hf_device_map[key]
-            elif '' in hf_device_map:
-                device_index = hf_device_map['']
+            elif "" in hf_device_map:
+                device_index = hf_device_map[""]
             else:
                 # Default to 'cpu'
-                device_index = 'cpu'
+                device_index = "cpu"
 
             return device_index
 
@@ -826,68 +926,88 @@ class QSTOPTDecoder(OPTPreTrainedModel):
         try:
             default_device = next(llm.parameters()).device
         except StopIteration:
-            default_device = torch.device('cpu')
+            default_device = torch.device("cpu")
 
         # Handle embed_tokens
-        self.embed_tokens = nn.Embedding(self.vocab_size, config.word_embed_proj_dim, self.padding_idx)
+        self.embed_tokens = nn.Embedding(
+            self.vocab_size, config.word_embed_proj_dim, self.padding_idx
+        )
         self.embed_tokens.weight = llm.embed_tokens.weight
         self.embed_tokens.weight.requires_grad = False
 
         # Get device for embed_tokens
-        embed_tokens_device = get_device(hf_device_map, "model.decoder.embed_tokens", default_device)
+        embed_tokens_device = get_device(
+            hf_device_map, "model.decoder.embed_tokens", default_device
+        )
         self.embed_tokens = self.embed_tokens.to(embed_tokens_device)
-        self.hf_device_map["model.decoder.embed_tokens"] = get_device_index(hf_device_map, "model.decoder.embed_tokens")
+        self.hf_device_map["model.decoder.embed_tokens"] = get_device_index(
+            hf_device_map, "model.decoder.embed_tokens"
+        )
 
         # Handle embed_positions
-        self.embed_positions = OPTLearnedPositionalEmbedding(config.max_position_embeddings, config.hidden_size)
+        self.embed_positions = OPTLearnedPositionalEmbedding(
+            config.max_position_embeddings, config.hidden_size
+        )
         self.embed_positions.weight = llm.embed_positions.weight
         self.embed_positions.weight.requires_grad = False
 
         # Get device for embed_positions
-        embed_positions_device = get_device(hf_device_map, "model.decoder.embed_positions", default_device)
+        embed_positions_device = get_device(
+            hf_device_map, "model.decoder.embed_positions", default_device
+        )
         self.embed_positions = self.embed_positions.to(embed_positions_device)
-        self.hf_device_map["model.decoder.embed_positions"] = get_device_index(hf_device_map,
-                                                                               "model.decoder.embed_positions")
+        self.hf_device_map["model.decoder.embed_positions"] = get_device_index(
+            hf_device_map, "model.decoder.embed_positions"
+        )
 
         # Handle backbone (decoder layers)
         self.backbone = llm.layers
 
         # Create downsample modules
-        self.downsample = nn.ModuleList([
-            AdapterLinear(
-                in_features=config.hidden_size,
-                out_features=int(config.hidden_size / QSTConfig.r),
-                r=int(QSTConfig.peft_hidden_size),
-                alpha_r=int(QSTConfig.peft_hidden_size),
-                activation=QSTConfig.activation,
-                add_layer_norm_after_adapter=QSTConfig.add_layer_norm_after_adapter,
-                add_layer_norm_before_adapter=QSTConfig.add_layer_norm_before_adapter,
-                dropout=QSTConfig.dropout,
-                bias=False
-            )
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.downsample = nn.ModuleList(
+            [
+                AdapterModule(
+                    in_features=config.hidden_size,
+                    out_features=int(config.hidden_size / QSTConfig.r),
+                    r=int(QSTConfig.peft_hidden_size),
+                    alpha_r=int(QSTConfig.peft_hidden_size),
+                    activation=QSTConfig.activation,
+                    add_layer_norm_after_adapter=QSTConfig.add_layer_norm_after_adapter,
+                    add_layer_norm_before_adapter=QSTConfig.add_layer_norm_before_adapter,
+                    dropout=QSTConfig.dropout,
+                    bias=False,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
 
         config_copy_qst = copy.deepcopy(config)
         config_copy_qst.hidden_size = int(config_copy_qst.hidden_size / QSTConfig.r)
         config_copy_qst.ffn_dim = int(config_copy_qst.ffn_dim / QSTConfig.r)
 
         # Create parameter z
-        self.z = nn.ParameterList([
-            nn.Parameter(torch.full((config_copy_qst.hidden_size,), 0.5))
-            for _ in range(config_copy_qst.num_hidden_layers)
-        ])
+        self.z = nn.ParameterList(
+            [
+                nn.Parameter(torch.full((config_copy_qst.hidden_size,), 0.5))
+                for _ in range(config_copy_qst.num_hidden_layers)
+            ]
+        )
 
         # Handle project_out
         if config.word_embed_proj_dim != config.hidden_size:
-            project_out_device = get_device(hf_device_map, "model.decoder.project_out", default_device)
+            project_out_device = get_device(
+                hf_device_map, "model.decoder.project_out", default_device
+            )
             if isinstance(llm.project_out, nn.Linear):
-                self.project_out = nn.Linear(config.hidden_size, config.word_embed_proj_dim, bias=False)
+                self.project_out = nn.Linear(
+                    config.hidden_size, config.word_embed_proj_dim, bias=False
+                )
                 self.project_out.weight = llm.project_out.weight
                 self.project_out.weight.requires_grad = False
                 self.project_out = self.project_out.to(project_out_device)
-                self.hf_device_map["model.decoder.project_out"] = get_device_index(hf_device_map,
-                                                                                   "model.decoder.project_out")
+                self.hf_device_map["model.decoder.project_out"] = get_device_index(
+                    hf_device_map, "model.decoder.project_out"
+                )
             else:
                 # Handle other possible types if necessary
                 raise NotImplementedError
@@ -896,14 +1016,19 @@ class QSTOPTDecoder(OPTPreTrainedModel):
 
         # Handle project_in
         if config.word_embed_proj_dim != config.hidden_size:
-            project_in_device = get_device(hf_device_map, "model.decoder.project_in", default_device)
+            project_in_device = get_device(
+                hf_device_map, "model.decoder.project_in", default_device
+            )
             if isinstance(llm.project_in, nn.Linear):
-                self.project_in = nn.Linear(config.word_embed_proj_dim, config.hidden_size, bias=False)
+                self.project_in = nn.Linear(
+                    config.word_embed_proj_dim, config.hidden_size, bias=False
+                )
                 self.project_in.weight = llm.project_in.weight
                 self.project_in.weight.requires_grad = False
                 self.project_in = self.project_in.to(project_in_device)
-                self.hf_device_map["model.decoder.project_in"] = get_device_index(hf_device_map,
-                                                                                  "model.decoder.project_in")
+                self.hf_device_map["model.decoder.project_in"] = get_device_index(
+                    hf_device_map, "model.decoder.project_in"
+                )
             else:
                 # Handle other possible types if necessary
                 raise NotImplementedError
@@ -912,33 +1037,43 @@ class QSTOPTDecoder(OPTPreTrainedModel):
 
         # Handle final_layer_norm and final_layer_norm_qst
         if config.do_layer_norm_before and not config._remove_final_layer_norm:
-            final_layer_norm_device = get_device(hf_device_map, "model.decoder.final_layer_norm", default_device)
+            final_layer_norm_device = get_device(
+                hf_device_map, "model.decoder.final_layer_norm", default_device
+            )
             self.final_layer_norm = nn.LayerNorm(
-                config.hidden_size, elementwise_affine=config.layer_norm_elementwise_affine
+                config.hidden_size,
+                elementwise_affine=config.layer_norm_elementwise_affine,
             )
             self.final_layer_norm.weight = llm.final_layer_norm.weight
             self.final_layer_norm.bias = llm.final_layer_norm.bias
             self.final_layer_norm.weight.requires_grad = False
             self.final_layer_norm.bias.requires_grad = False
             self.final_layer_norm = self.final_layer_norm.to(final_layer_norm_device)
-            self.hf_device_map["model.decoder.final_layer_norm"] = get_device_index(hf_device_map,
-                                                                                    "model.decoder.final_layer_norm")
+            self.hf_device_map["model.decoder.final_layer_norm"] = get_device_index(
+                hf_device_map, "model.decoder.final_layer_norm"
+            )
 
             self.final_layer_norm_qst = nn.LayerNorm(
-                int(config.hidden_size / QSTConfig.r), elementwise_affine=config.layer_norm_elementwise_affine
+                int(config.hidden_size / QSTConfig.r),
+                elementwise_affine=config.layer_norm_elementwise_affine,
             )
-            self.final_layer_norm_qst = self.final_layer_norm_qst.to(final_layer_norm_device)
-            self.hf_device_map["model.decoder.final_layer_norm_qst"] = get_device_index(hf_device_map,
-                                                                                        "model.decoder.final_layer_norm")
+            self.final_layer_norm_qst = self.final_layer_norm_qst.to(
+                final_layer_norm_device
+            )
+            self.hf_device_map["model.decoder.final_layer_norm_qst"] = get_device_index(
+                hf_device_map, "model.decoder.final_layer_norm"
+            )
         else:
             self.final_layer_norm = None
             self.final_layer_norm_qst = None
 
         # Create qst_layers
-        self.qst_layers = nn.ModuleList([
-            OPTDecoderLayer(config_copy_qst)
-            for _ in range(config_copy_qst.num_hidden_layers)
-        ])
+        self.qst_layers = nn.ModuleList(
+            [
+                OPTDecoderLayer(config_copy_qst)
+                for _ in range(config_copy_qst.num_hidden_layers)
+            ]
+        )
 
         self.gradient_checkpointing = False
 
@@ -965,7 +1100,9 @@ class QSTOPTDecoder(OPTPreTrainedModel):
             self.hf_device_map[f"model.decoder.downsample.{i}"] = layer_device_index
 
     # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
-    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+    def _prepare_decoder_attention_mask(
+        self, attention_mask, input_shape, inputs_embeds, past_key_values_length
+    ):
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         combined_attention_mask = None
@@ -979,29 +1116,31 @@ class QSTOPTDecoder(OPTPreTrainedModel):
 
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
-                inputs_embeds.device
-            )
+            expanded_attn_mask = _expand_mask(
+                attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
+            ).to(inputs_embeds.device)
             combined_attention_mask = (
-                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+                expanded_attn_mask
+                if combined_attention_mask is None
+                else expanded_attn_mask + combined_attention_mask
             )
 
         return combined_attention_mask
 
     def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            head_mask: Optional[torch.Tensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            qst_past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_qst_attentions=False,
-            output_qst_hidden_states=False,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        qst_past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_qst_attentions=False,
+        output_qst_hidden_states=False,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, QSTBaseModelOutputWithPast]:
         r"""
         Args:
@@ -1050,38 +1189,54 @@ class QSTOPTDecoder(OPTPreTrainedModel):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+            )
         elif input_ids is not None:
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
         else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+            raise ValueError(
+                "You have to specify either decoder_input_ids or decoder_inputs_embeds"
+            )
 
         with torch.no_grad():
             if inputs_embeds is None:
                 inputs_embeds = self.embed_tokens(input_ids)
 
         batch_size, seq_length = input_shape
-        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        past_key_values_length = (
+            past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        )
 
         # required mask seq length can be calculated via length of past
         mask_seq_length = past_key_values_length + seq_length
 
         # embed positions
         if attention_mask is None:
-            attention_mask = torch.ones(batch_size, mask_seq_length, device=inputs_embeds.device)
+            attention_mask = torch.ones(
+                batch_size, mask_seq_length, device=inputs_embeds.device
+            )
         elif attention_mask.shape[1] != mask_seq_length:
             raise ValueError(
                 f"The provided attention mask has length {attention_mask.shape[1]}, but its length should be "
@@ -1140,6 +1295,7 @@ class QSTOPTDecoder(OPTPreTrainedModel):
                     )
 
         qst_hidden_states = self.downsample[0](hidden_states)
+
         for idx, decoder_layer in enumerate(self.backbone):
 
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
@@ -1152,10 +1308,15 @@ class QSTOPTDecoder(OPTPreTrainedModel):
                 if dropout_probability < self.layerdrop:
                     continue
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
-            qst_past_key_value = qst_past_key_values[idx] if qst_past_key_values is not None else None
+            past_key_value = (
+                past_key_values[idx] if past_key_values is not None else None
+            )
+            qst_past_key_value = (
+                qst_past_key_values[idx] if qst_past_key_values is not None else None
+            )
 
             if self.gradient_checkpointing and self.training:
+
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
@@ -1183,9 +1344,10 @@ class QSTOPTDecoder(OPTPreTrainedModel):
                 with torch.no_grad():
                     layer_outputs = decoder_layer(
                         hidden_states,
-
                         attention_mask=causal_attention_mask,
-                        layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                        layer_head_mask=(
+                            head_mask[idx] if head_mask is not None else None
+                        ),
                         past_key_value=past_key_value,
                         output_attentions=output_attentions,
                         use_cache=use_cache,
@@ -1194,7 +1356,8 @@ class QSTOPTDecoder(OPTPreTrainedModel):
                 z = torch.sigmoid(self.z[idx])
                 qst_hidden_states = qst_hidden_states.to(hidden_states.device)
                 qst_hidden_states = (1 - z) * self.downsample[idx](
-                    hidden_states) + z * qst_hidden_states
+                    hidden_states
+                ) + z * qst_hidden_states
 
                 qst_layer_outputs = self.qst_layers[idx](
                     qst_hidden_states,
@@ -1209,7 +1372,9 @@ class QSTOPTDecoder(OPTPreTrainedModel):
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
-                qst_next_decoder_cache += (qst_layer_outputs[2 if output_attentions else 1],)
+                qst_next_decoder_cache += (
+                    qst_layer_outputs[2 if output_attentions else 1],
+                )
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1218,13 +1383,17 @@ class QSTOPTDecoder(OPTPreTrainedModel):
 
         with torch.no_grad():
             if self.final_layer_norm is not None:
-                hidden_states = self.final_layer_norm(hidden_states.to(self.final_layer_norm.weight.device))
+                hidden_states = self.final_layer_norm(
+                    hidden_states.to(self.final_layer_norm.weight.device)
+                )
 
             if self.project_out is not None:
                 hidden_states = self.project_out(hidden_states)
 
         if self.final_layer_norm_qst is not None:
-            qst_hidden_states = self.final_layer_norm_qst(qst_hidden_states.to(self.final_layer_norm.weight.device))
+            qst_hidden_states = self.final_layer_norm_qst(
+                qst_hidden_states.to(self.final_layer_norm.weight.device)
+            )
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -1240,9 +1409,20 @@ class QSTOPTDecoder(OPTPreTrainedModel):
             qst_next_cache = None
 
         if not return_dict:
-            return tuple(v for v in
-                         [qst_hidden_states, hidden_states, qst_next_cache, next_cache, qst_all_hidden_states,
-                          all_hidden_states, qst_self_attns, all_self_attns] if v is not None)
+            return tuple(
+                v
+                for v in [
+                    qst_hidden_states,
+                    hidden_states,
+                    qst_next_cache,
+                    next_cache,
+                    qst_all_hidden_states,
+                    all_hidden_states,
+                    qst_self_attns,
+                    all_self_attns,
+                ]
+                if v is not None
+            )
 
         return QSTBaseModelOutputWithPast(
             last_qst_hidden_states=qst_hidden_states,
@@ -1319,23 +1499,31 @@ class OPTModel(OPTPreTrainedModel):
         expected_output=_EXPECTED_OUTPUT_SHAPE,
     )
     def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            head_mask: Optional[torch.Tensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
@@ -1389,26 +1577,34 @@ class QSTOPTModel(OPTPreTrainedModel):
         expected_output=_EXPECTED_OUTPUT_SHAPE,
     )
     def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            head_mask: Optional[torch.Tensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            qst_past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_qst_attentions=False,
-            output_qst_hidden_states=False,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        qst_past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_qst_attentions=False,
+        output_qst_hidden_states=False,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, QSTBaseModelOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
@@ -1455,7 +1651,9 @@ class OPTForCausalLM(OPTPreTrainedModel):
         self.model = OPTModel(config)
 
         # the lm_head weight is automatically tied to the embed tokens weight
-        self.lm_head = nn.Linear(config.word_embed_proj_dim, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(
+            config.word_embed_proj_dim, config.vocab_size, bias=False
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1478,19 +1676,21 @@ class OPTForCausalLM(OPTPreTrainedModel):
     def get_decoder(self):
         return self.model.decoder
 
-    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(
+        output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC
+    )
     def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            head_mask: Optional[torch.Tensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1566,11 +1766,19 @@ class OPTForCausalLM(OPTPreTrainedModel):
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious. I'm just a little bit of a weirdo."
         ```"""
 
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model.decoder(
@@ -1596,7 +1804,9 @@ class OPTForCausalLM(OPTPreTrainedModel):
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            loss = loss_fct(
+                shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1)
+            )
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1611,7 +1821,12 @@ class OPTForCausalLM(OPTPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-            self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs,
     ):
         if past_key_values:
             input_ids = input_ids[:, -1:]
@@ -1635,7 +1850,11 @@ class OPTForCausalLM(OPTPreTrainedModel):
     def _reorder_cache(past_key_values, beam_idx):
         reordered_past = ()
         for layer_past in past_key_values:
-            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
+            reordered_past += (
+                tuple(
+                    past_state.index_select(0, beam_idx) for past_state in layer_past
+                ),
+            )
         return reordered_past
 
 
@@ -1653,28 +1872,31 @@ class QSTOPTForCausalLM(OPTPreTrainedModel, QSTGenerationMixin):
         self.hf_device_map = self.model.decoder.hf_device_map
 
         # the lm_head weight is automatically tied to the embed tokens weight
-        self.lm_head_z = nn.Parameter(torch.Tensor([1.0 for i in range(self.hidden_size)])).to(
-            llm.lm_head.weight.device)
+        self.lm_head_z = nn.Parameter(
+            torch.Tensor([1.0 for i in range(self.hidden_size)])
+        ).to(llm.lm_head.weight.device)
 
         self.upsample = nn.Linear(self.qst_hidden_dim, config.word_embed_proj_dim).to(
-            llm.lm_head.weight.device)
+            llm.lm_head.weight.device
+        )
 
-        self.lm_head = nn.Linear(config.word_embed_proj_dim, config.vocab_size, bias=False).to(
-            llm.lm_head.weight.device)
+        self.lm_head = nn.Linear(
+            config.word_embed_proj_dim, config.vocab_size, bias=False
+        ).to(llm.lm_head.weight.device)
         self.lm_head.weight = llm.lm_head.weight
         self.lm_head.weight.requires_grad = False
 
-        if str(llm.lm_head.weight.device) == 'cpu':
-            self.hf_device_map["lm_head"] = 'cpu'
-            self.hf_device_map["lm_head_z"] = 'cpu'
-            self.hf_device_map["upsample"] = 'cpu'
+        if str(llm.lm_head.weight.device) == "cpu":
+            self.hf_device_map["lm_head"] = "cpu"
+            self.hf_device_map["lm_head_z"] = "cpu"
+            self.hf_device_map["upsample"] = "cpu"
         else:
             self.hf_device_map["lm_head"] = int(str(llm.lm_head.weight.device)[-1])
             self.hf_device_map["lm_head_z"] = int(str(llm.lm_head.weight.device)[-1])
             self.hf_device_map["upsample"] = int(str(llm.lm_head.weight.device)[-1])
 
-        if llm.hf_device_map == {'': 0}:
-            self.hf_device_map = {'': 0}
+        if llm.hf_device_map == {"": 0}:
+            self.hf_device_map = {"": 0}
 
         del llm
 
@@ -1696,22 +1918,24 @@ class QSTOPTForCausalLM(OPTPreTrainedModel, QSTGenerationMixin):
     def get_decoder(self):
         return self.model.decoder
 
-    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(
+        output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC
+    )
     def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            head_mask: Optional[torch.Tensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            qst_past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_qst_attentions=False,
-            output_qst_hidden_states=False,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        qst_past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_qst_attentions=False,
+        output_qst_hidden_states=False,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, QSTCausalLMOutputWithPast]:
         r"""
         Args:
@@ -1787,11 +2011,19 @@ class QSTOPTForCausalLM(OPTPreTrainedModel, QSTGenerationMixin):
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious. I'm just a little bit of a weirdo."
         ```"""
 
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model.decoder(
@@ -1818,7 +2050,9 @@ class QSTOPTForCausalLM(OPTPreTrainedModel, QSTGenerationMixin):
 
         qst_hidden_states = self.upsample(qst_hidden_states)
         lm_head_z = torch.sigmoid(self.lm_head_z)
-        final_hidden_states = lm_head_z * qst_hidden_states + (1 - lm_head_z) * hidden_states
+        final_hidden_states = (
+            lm_head_z * qst_hidden_states + (1 - lm_head_z) * hidden_states
+        )
 
         # with torch.no_grad():
         logits = self.lm_head(final_hidden_states).contiguous()
@@ -1832,7 +2066,9 @@ class QSTOPTForCausalLM(OPTPreTrainedModel, QSTGenerationMixin):
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            loss = loss_fct(
+                shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1)
+            )
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1850,8 +2086,12 @@ class QSTOPTForCausalLM(OPTPreTrainedModel, QSTGenerationMixin):
         )
 
     def prepare_inputs_for_generation(
-            self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None,
-            **kwargs
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs,
     ):
         if past_key_values:
             input_ids = input_ids[:, -1:]
@@ -1876,7 +2116,11 @@ class QSTOPTForCausalLM(OPTPreTrainedModel, QSTGenerationMixin):
     def _reorder_cache(past_key_values, beam_idx):
         reordered_past = ()
         for layer_past in past_key_values:
-            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
+            reordered_past += (
+                tuple(
+                    past_state.index_select(0, beam_idx) for past_state in layer_past
+                ),
+            )
         return reordered_past
 
     def load_qst_state(self, path):
@@ -1936,17 +2180,17 @@ class OPTForSequenceClassification(OPTPreTrainedModel):
         expected_loss=_SEQ_CLASS_EXPECTED_LOSS,
     )
     def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            head_mask: Optional[torch.FloatTensor] = None,
-            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1954,7 +2198,9 @@ class OPTForSequenceClassification(OPTPreTrainedModel):
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         transformer_outputs = self.model(
             input_ids,
@@ -1980,7 +2226,9 @@ class OPTForSequenceClassification(OPTPreTrainedModel):
             sequence_lengths = -1
         else:
             if input_ids is not None:
-                sequence_lengths = (torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1).to(logits.device)
+                sequence_lengths = (
+                    torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1
+                ).to(logits.device)
             else:
                 sequence_lengths = -1
                 logger.warning(
@@ -1988,14 +2236,18 @@ class OPTForSequenceClassification(OPTPreTrainedModel):
                     "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
                 )
 
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+        pooled_logits = logits[
+            torch.arange(batch_size, device=logits.device), sequence_lengths
+        ]
 
         loss = None
         if labels is not None:
             if self.config.problem_type is None:
                 if self.num_labels == 1:
                     self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                elif self.num_labels > 1 and (
+                    labels.dtype == torch.long or labels.dtype == torch.int
+                ):
                     self.config.problem_type = "single_label_classification"
                 else:
                     self.config.problem_type = "multi_label_classification"
@@ -2008,7 +2260,9 @@ class OPTForSequenceClassification(OPTPreTrainedModel):
                     loss = loss_fct(pooled_logits, labels)
             elif self.config.problem_type == "single_label_classification":
                 loss_fct = CrossEntropyLoss()
-                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
+                loss = loss_fct(
+                    pooled_logits.view(-1, self.num_labels), labels.view(-1)
+                )
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(pooled_logits, labels)
@@ -2041,23 +2295,29 @@ class QSTOPTForSequenceClassification(OPTPreTrainedModel):
         self.model = QSTOPTModel(llm.model, config, QSTConfig, llm.hf_device_map)
         self.hf_device_map = self.model.decoder.hf_device_map
 
-        self.score_z = nn.Parameter(torch.zeros(config.hidden_size)).to(llm.score.weight.device)
-        self.upsample = nn.Linear(self.qst_hidden_dim, config.word_embed_proj_dim).to(llm.score.weight.device)
-        self.score = nn.Linear(config.word_embed_proj_dim, self.num_labels, bias=False).to(llm.score.weight.device)
+        self.score_z = nn.Parameter(torch.zeros(config.hidden_size)).to(
+            llm.score.weight.device
+        )
+        self.upsample = nn.Linear(self.qst_hidden_dim, config.word_embed_proj_dim).to(
+            llm.score.weight.device
+        )
+        self.score = nn.Linear(
+            config.word_embed_proj_dim, self.num_labels, bias=False
+        ).to(llm.score.weight.device)
         self.score.weight = llm.score.weight
         # self.score.weight.requires_grad = False
 
-        if str(llm.score.weight.device) == 'cpu':
-            self.hf_device_map["score"] = 'cpu'
-            self.hf_device_map["score_z"] = 'cpu'
-            self.hf_device_map["upsample"] = 'cpu'
+        if str(llm.score.weight.device) == "cpu":
+            self.hf_device_map["score"] = "cpu"
+            self.hf_device_map["score_z"] = "cpu"
+            self.hf_device_map["upsample"] = "cpu"
         else:
             self.hf_device_map["score"] = int(str(llm.score.weight.device)[-1])
             self.hf_device_map["score_z"] = int(str(llm.score.weight.device)[-1])
             self.hf_device_map["upsample"] = int(str(llm.score.weight.device)[-1])
 
-        if llm.hf_device_map == {'': 0}:
-            self.hf_device_map = {'': 0}
+        if llm.hf_device_map == {"": 0}:
+            self.hf_device_map = {"": 0}
 
         del llm
 
@@ -2073,20 +2333,20 @@ class QSTOPTForSequenceClassification(OPTPreTrainedModel):
         expected_loss=_SEQ_CLASS_EXPECTED_LOSS,
     )
     def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            head_mask: Optional[torch.FloatTensor] = None,
-            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-            qst_past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_qst_attentions: Optional[bool] = None,
-            output_qst_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        qst_past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_qst_attentions: Optional[bool] = None,
+        output_qst_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -2094,7 +2354,9 @@ class QSTOPTForSequenceClassification(OPTPreTrainedModel):
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         transformer_outputs = self.model(
             input_ids,
@@ -2120,7 +2382,9 @@ class QSTOPTForSequenceClassification(OPTPreTrainedModel):
 
         qst_hidden_states = self.upsample(qst_hidden_states)
         score_z = torch.sigmoid(self.score_z)
-        final_hidden_states = score_z * qst_hidden_states + (1 - score_z) * hidden_states
+        final_hidden_states = (
+            score_z * qst_hidden_states + (1 - score_z) * hidden_states
+        )
 
         logits = self.score(final_hidden_states)
 
@@ -2133,7 +2397,9 @@ class QSTOPTForSequenceClassification(OPTPreTrainedModel):
             sequence_lengths = -1
         else:
             if input_ids is not None:
-                sequence_lengths = (torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1).to(logits.device)
+                sequence_lengths = (
+                    torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1
+                ).to(logits.device)
             else:
                 sequence_lengths = -1
                 logger.warning(
@@ -2141,14 +2407,18 @@ class QSTOPTForSequenceClassification(OPTPreTrainedModel):
                     "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
                 )
 
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+        pooled_logits = logits[
+            torch.arange(batch_size, device=logits.device), sequence_lengths
+        ]
 
         loss = None
         if labels is not None:
             if self.config.problem_type is None:
                 if self.num_labels == 1:
                     self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                elif self.num_labels > 1 and (
+                    labels.dtype == torch.long or labels.dtype == torch.int
+                ):
                     self.config.problem_type = "single_label_classification"
                 else:
                     self.config.problem_type = "multi_label_classification"
@@ -2161,7 +2431,9 @@ class QSTOPTForSequenceClassification(OPTPreTrainedModel):
                     loss = loss_fct(pooled_logits, labels)
             elif self.config.problem_type == "single_label_classification":
                 loss_fct = CrossEntropyLoss()
-                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
+                loss = loss_fct(
+                    pooled_logits.view(-1, self.num_labels), labels.view(-1)
+                )
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(pooled_logits, labels)
@@ -2230,20 +2502,22 @@ class OPTForQuestionAnswering(OPTPreTrainedModel):
         self.post_init()
 
     @add_start_docstrings_to_model_forward(OPT_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=QuestionAnsweringModelOutput, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(
+        output_type=QuestionAnsweringModelOutput, config_class=_CONFIG_FOR_DOC
+    )
     def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            head_mask: Optional[torch.FloatTensor] = None,
-            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            start_positions: Optional[torch.LongTensor] = None,
-            end_positions: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        start_positions: Optional[torch.LongTensor] = None,
+        end_positions: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, QuestionAnsweringModelOutput]:
         r"""
         start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -2288,7 +2562,9 @@ class OPTForQuestionAnswering(OPTPreTrainedModel):
         >>> predicted
         ' a nice puppet'
         ```"""
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         transformer_outputs = self.model(
             input_ids,
