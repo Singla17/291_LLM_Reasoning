@@ -72,11 +72,10 @@ def print_trainable_parameters(args, model):
 task_to_keys = {
     "rte": ("premise", "hypothesis"),
     "boolq": ("question", "passage"),
-    "axb": ("sentence1", "sentence2"),
     "cb": ("premise", "hypothesis")
 }
 
-SUPERGLUE_TASKS = ["cb", "rte"]
+SUPERGLUE_TASKS = ["boolq", "rte"]
 DEFAULT_PAD_TOKEN = "[PAD]"
 
 
@@ -127,6 +126,10 @@ def train(task, parameters):
         return tokenizer(examples[sentence1_key], examples[sentence2_key], truncation=True, padding=True, )
 
     encoded_dataset = dataset.map(preprocess_function, batched=True)
+
+    if task == "boolq":
+        encoded_dataset['train'] = encoded_dataset['train'].shuffle(seed=42).select(range(2500))
+        encoded_dataset['validation'] = encoded_dataset['validation'].shuffle(seed=42).select(range(500))
 
 
 
