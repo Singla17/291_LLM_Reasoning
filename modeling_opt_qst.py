@@ -880,7 +880,10 @@ class QSTOPTDecoder(OPTPreTrainedModel):
         ])
 
         self.qst_projection = nn.ModuleList([
-            nn.Linear( self.output_features[layer_idx] + int( config.hidden_size / QSTConfig.r ) if layer_idx > 0 else 2 * self.output_features[layer_idx], int(config.hidden_size / QSTConfig.r), bias=False)
+            nn.Linear(
+                in_features=self.output_features[layer_idx] + int( config.hidden_size / QSTConfig.r ) if layer_idx > 0 else 2 * self.output_features[layer_idx],
+                out_features= int(config.hidden_size / QSTConfig.r),
+                bias=False)
             for layer_idx in range(config.num_hidden_layers)
         ])
 
@@ -890,8 +893,8 @@ class QSTOPTDecoder(OPTPreTrainedModel):
 
         # Create parameter z
         self.z = nn.ParameterList([
-            nn.Parameter(torch.full((config_copy_qst.hidden_size,), 0.5))
-            for _ in range(config_copy_qst.num_hidden_layers)
+            nn.Parameter(torch.full((config_copy_qst.hidden_size,), 0.5)) if layer_idx > 0 else nn.Parameter(torch.full((self.output_features[0],), 0.5))
+            for layer_idx in range(config_copy_qst.num_hidden_layers)
         ])
 
         # Handle project_out
@@ -1210,7 +1213,10 @@ class QSTOPTDecoder(OPTPreTrainedModel):
                 z = torch.sigmoid(self.z[idx])
                 qst_hidden_states = qst_hidden_states.to(hidden_states.device)
                 downsampled = self.downsample[idx](hidden_states)
-                qst_hidden_states = self.qst_projection[idx](torch.cat([(1-z)* downsampled, z*qst_hidden_states], dim=-1))
+                downsampled = downsampled.to(qst_hidden_states.device)
+                qst_temp_cat = torch.cat((downsampled, z*qst_hidden_states), dim=-1)
+                qst_temp_cat = qst_temp_cat.to(qst_hidden_states.device)
+                qst_hidden_states = self.qst_projection[idx](qst_temp_cat)
 
                 qst_layer_outputs = self.qst_layers[idx](
                     qst_hidden_states,
