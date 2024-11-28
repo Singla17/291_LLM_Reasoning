@@ -844,6 +844,14 @@ class QSTLlamaModel(LlamaPreTrainedModel):
             for layer_idx in range(config.num_hidden_layers)
         ])
 
+        self.qst_projection = nn.ModuleList([
+            nn.Linear(
+                in_features=self.output_features[layer_idx] + int( config.hidden_size / QSTConfig.r ) if layer_idx > 0 else 2 * self.output_features[layer_idx],
+                out_features= int(config.hidden_size / QSTConfig.r),
+                bias=False)
+            for layer_idx in range(config.num_hidden_layers)
+        ])
+
         config_copy_qst = copy.deepcopy(config)
         config_copy_qst.hidden_size = int(config_copy_qst.hidden_size / QSTConfig.r)
         config_copy_qst.intermediate_size = int(config_copy_qst.intermediate_size / QSTConfig.r)
