@@ -14,6 +14,7 @@
 # limitations under the License.
 """ PyTorch OPT model."""
 import copy
+import math
 import os
 from copy import deepcopy
 from typing import List, Optional, Tuple, Union
@@ -852,11 +853,21 @@ class QSTOPTDecoder(OPTPreTrainedModel):
         # Handle backbone (decoder layers)
         self.backbone = llm.layers
 
+        def get_output_feature_sizes(max_feature_size, num_layers, min_feature_size=4):
+            values = [min_feature_size * (2 ** i) for i in range(int(max_feature_size).bit_length()) if min_feature_size * (2 ** i) <= max_feature_size]
+            if max_feature_size not in values:
+                values.append(max_feature_size)
+            repetitions, remainder = divmod(num_layers, len(values))
+            result = values * repetitions + values[:remainder]
+            result = sorted(result)
+            return result
+
+        self.output_features = get_output_feature_sizes(config.hidden_size // 2 , config.num_hidden_layers)
         # Create downsample modules
         self.downsample = nn.ModuleList([
             AdapterLinear(
                 in_features=config.hidden_size,
-                out_features=int(config.hidden_size / QSTConfig.r),
+                out_features= self.output_features[layer_idx],
                 r=int(QSTConfig.peft_hidden_size),
                 alpha_r=int(QSTConfig.peft_hidden_size),
                 activation=QSTConfig.activation,
@@ -865,7 +876,12 @@ class QSTOPTDecoder(OPTPreTrainedModel):
                 dropout=QSTConfig.dropout,
                 bias=False
             )
-            for _ in range(config.num_hidden_layers)
+            for layer_idx in range(config.num_hidden_layers)
+        ])
+
+        self.qst_projection = nn.ModuleList([
+            nn.Linear( self.output_features[layer_idx] + int( config.hidden_size / QSTConfig.r ) if layer_idx > 0 else 2 * self.output_features[layer_idx], int(config.hidden_size / QSTConfig.r), bias=False)
+            for layer_idx in range(config.num_hidden_layers)
         ])
 
         config_copy_qst = copy.deepcopy(config)
@@ -1193,8 +1209,8 @@ class QSTOPTDecoder(OPTPreTrainedModel):
                 hidden_states = layer_outputs[0]
                 z = torch.sigmoid(self.z[idx])
                 qst_hidden_states = qst_hidden_states.to(hidden_states.device)
-                qst_hidden_states = (1 - z) * self.downsample[idx](
-                    hidden_states) + z * qst_hidden_states
+                downsampled = self.downsample[idx](hidden_states)
+                qst_hidden_states = self.qst_projection[idx](torch.cat([(1-z)* downsampled, z*qst_hidden_states], dim=-1))
 
                 qst_layer_outputs = self.qst_layers[idx](
                     qst_hidden_states,
