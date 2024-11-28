@@ -819,11 +819,21 @@ class QSTLlamaModel(LlamaPreTrainedModel):
 
         self.gradient_checkpointing = False
 
+        def get_output_feature_sizes(max_feature_size, num_layers, min_feature_size=4):
+            values = [min_feature_size * (2 ** i) for i in range(int(max_feature_size).bit_length()) if min_feature_size * (2 ** i) <= max_feature_size]
+            if max_feature_size not in values:
+                values.append(max_feature_size)
+            repetitions, remainder = divmod(num_layers, len(values))
+            result = values * repetitions + values[:remainder]
+            result = sorted(result)
+            return result
+
+        self.output_features = get_output_feature_sizes(config.hidden_size // 2 , config.num_hidden_layers)
         # Initialize the downsample module
         self.downsample = nn.ModuleList([
             AdapterLinear(
                 in_features=config.hidden_size,
-                out_features=int(config.hidden_size / QSTConfig.r),
+                out_features= self.output_features[layer_idx],
                 r=int(QSTConfig.peft_hidden_size),
                 alpha_r=int(QSTConfig.peft_hidden_size),
                 activation=QSTConfig.activation,
@@ -831,7 +841,7 @@ class QSTLlamaModel(LlamaPreTrainedModel):
                 add_layer_norm_before_adapter=QSTConfig.add_layer_norm_before_adapter,
                 dropout=QSTConfig.dropout
             )
-            for _ in range(config.num_hidden_layers)
+            for layer_idx in range(config.num_hidden_layers)
         ])
 
         config_copy_qst = copy.deepcopy(config)
@@ -840,8 +850,8 @@ class QSTLlamaModel(LlamaPreTrainedModel):
 
         # Initialize the parameter z
         self.z = nn.ParameterList([
-            nn.Parameter(torch.full((config_copy_qst.hidden_size,), 0.5))
-            for _ in range(config_copy_qst.num_hidden_layers)
+            nn.Parameter(torch.full((config_copy_qst.hidden_size,), 0.5)) if layer_idx > 0 else nn.Parameter(torch.full((self.output_features[0],), 0.5))
+            for layer_idx in range(config_copy_qst.num_hidden_layers)
         ])
 
         # Initialize the qst_layers module
@@ -1085,7 +1095,11 @@ class QSTLlamaModel(LlamaPreTrainedModel):
                 z = torch.sigmoid(self.z[idx])
 
                 qst_hidden_states = qst_hidden_states.to(hidden_states.device)
-                qst_hidden_states = (1 - z) * self.downsample[idx](hidden_states) + z * (qst_hidden_states)
+                downsampled = self.downsample[idx](hidden_states)
+                downsampled = downsampled.to(qst_hidden_states.device)
+                qst_temp_cat = torch.cat((downsampled, z*qst_hidden_states), dim=-1)
+                qst_temp_cat = qst_temp_cat.to(qst_hidden_states.device)
+                qst_hidden_states = self.qst_projection[idx](qst_temp_cat)
 
                 qst_layer_outputs = self.qst_layers[idx](
                     qst_hidden_states,
